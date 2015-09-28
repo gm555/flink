@@ -77,6 +77,13 @@ class DistanceMetricSuite extends FlatSpec with Matchers {
     TanimotoDistanceMetric().distance(vec1, vec2) should be(1 - (1.0 / (2 + 2 - 1)) +- EPSILON)
   }
 
+  it should "calculate Gaussian distance correctly" in {
+    val vec1 = DenseVector(-0.2060, -0.2760, 0.001, 0.512)
+    val vec2 = DenseVector(0.0940, 0.3240, 0.1035, -0.0043)
+
+    GaussianDistanceMetric(0.2).distance(vec1, vec2) should be(1.1297e-4 +- EPSILON)
+  }
+
   it should "be serialized" in {
     val metric = EuclideanDistanceMetric()
     val byteOutput = new ByteArrayOutputStream()
@@ -93,3 +100,4 @@ class DistanceMetricSuite extends FlatSpec with Matchers {
     restoredMetric should be(an[EuclideanDistanceMetric])
   }
 }
+

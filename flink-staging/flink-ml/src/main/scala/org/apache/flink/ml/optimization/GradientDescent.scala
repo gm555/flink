@@ -16,7 +16,6 @@
  * limitations under the License.
  */
 
-
 package org.apache.flink.ml.optimization
 
 import org.apache.flink.api.scala._
@@ -25,6 +24,7 @@ import org.apache.flink.ml.math._
 import org.apache.flink.ml.optimization.IterativeSolver.{ConvergenceThreshold, Iterations, LearningRate}
 import org.apache.flink.ml.optimization.Solver._
 import org.apache.flink.ml._
+import com.github.fommil.netlib.BLAS.{getInstance => blas}
 
 /** Base class which performs Stochastic Gradient Descent optimization using mini batches.
   *
@@ -50,11 +50,26 @@ abstract class GradientDescent extends IterativeSolver {
     *
     * @param data A Dataset of LabeledVector (label, features) pairs
     * @param initialWeights The initial weights that will be optimized
+    * @param kernelMatrix The kernel matrix when training kernel machines
     * @return The weights, optimized for the provided data.
     */
   override def optimize(
     data: DataSet[LabeledVector],
     initialWeights: Option[DataSet[WeightVector]]): DataSet[WeightVector] = {
+    optimize(data, initialWeights, null)
+  }
+
+  /** Provides a solution for the given optimization problem
+    *
+    * @param data A Dataset of LabeledVector (label, features) pairs
+    * @param initialWeights The initial weights that will be optimized
+    * @param kernelMatrix The kernel matrix when training kernel machines
+    * @return The weights, optimized for the provided data.
+    */
+  def optimize(
+    data: DataSet[LabeledVector],
+    initialWeights: Option[DataSet[WeightVector]],
+    kernelMatrix: DataSet[Array[Double]]): DataSet[WeightVector] = {
 
     val numberOfIterations: Int = parameters(Iterations)
     val convergenceThresholdOption: Option[Double] = parameters.get(ConvergenceThreshold)
@@ -75,7 +90,8 @@ abstract class GradientDescent extends IterativeSolver {
           numberOfIterations,
           regularizationConstant,
           learningRate,
-          lossFunction)
+          lossFunction,
+          kernelMatrix)
       case Some(convergence) =>
         optimizeWithConvergenceCriterion(
           data,
@@ -84,8 +100,8 @@ abstract class GradientDescent extends IterativeSolver {
           regularizationConstant,
           learningRate,
           convergence,
-          lossFunction
-        )
+          lossFunction,
+          kernelMatrix)
     }
   }
 
@@ -96,8 +112,8 @@ abstract class GradientDescent extends IterativeSolver {
       regularizationConstant: Double,
       learningRate: Double,
       convergenceThreshold: Double,
-      lossFunction: LossFunction)
-    : DataSet[WeightVector] = {
+      lossFunction: LossFunction,
+      kernelMatrix: DataSet[Array[Double]]): DataSet[WeightVector] = {
     // We have to calculate for each weight vector the sum of squared residuals,
     // and then sum them and apply regularization
     val initialLossSumDS = calculateLoss(dataPoints, initialWeightsDS, lossFunction)
@@ -119,7 +135,8 @@ abstract class GradientDescent extends IterativeSolver {
           previousWeightsDS,
           lossFunction,
           regularizationConstant,
-          learningRate)
+          learningRate,
+          kernelMatrix)
 
         val currentLossSumDS = calculateLoss(dataPoints, currentWeightsDS, lossFunction)
 
@@ -146,13 +163,13 @@ abstract class GradientDescent extends IterativeSolver {
       data: DataSet[LabeledVector],
       initialWeightsDS: DataSet[WeightVector],
       numberOfIterations: Int,
-      regularizationConstant: Double,
+      regularization: Double,
       learningRate: Double,
-      lossFunction: LossFunction)
-    : DataSet[WeightVector] = {
+      lossFunction: LossFunction,
+      kernelMatrix: DataSet[Array[Double]]): DataSet[WeightVector] = {
     initialWeightsDS.iterate(numberOfIterations) {
       weightVectorDS => {
-        SGDStep(data, weightVectorDS, lossFunction, regularizationConstant, learningRate)
+        SGDStep(data, weightVectorDS, lossFunction, regularization, learningRate, kernelMatrix)
       }
     }
   }
@@ -168,8 +185,8 @@ abstract class GradientDescent extends IterativeSolver {
     currentWeights: DataSet[WeightVector],
     lossFunction: LossFunction,
     regularizationConstant: Double,
-    learningRate: Double)
-  : DataSet[WeightVector] = {
+    learningRate: Double,
+    kernelMatrix: DataSet[Array[Double]]): DataSet[WeightVector] = {
 
     data.mapWithBcVariable(currentWeights){
       (data, weightVector) => (lossFunction.gradient(data, weightVector), 1)
@@ -183,15 +200,22 @@ abstract class GradientDescent extends IterativeSolver {
           rightGradVector.weights, leftGradVector.intercept + rightGradVector.intercept)
 
         (gradients , leftCount + rightCount)
-    }.mapWithBcVariableIteration(currentWeights){
-      (gradientCount, weightVector, iteration) => {
+    }.mapWithBcVariableIteration(getKernelRegularization(currentWeights,
+      kernelMatrix)) {
+      (gradientCount, kernelRegularization, iteration) => {
+
+        val (weightVector, kernelRegularizationVariable) = kernelRegularization
+
         val (WeightVector(weights, intercept), count) = gradientCount
 
-        BLAS.scal(1.0/count, weights)
+        // kernel-regularized total gradient
+        BLAS.axpy(regularizationConstant, kernelRegularizationVariable, weights)
 
-        val gradient = WeightVector(weights, intercept/count)
+        // kernel-regularized gradient per point
+        BLAS.scal(1.0 / count, weights)
+        val gradient = WeightVector(weights, intercept / count)
 
-        val effectiveLearningRate = learningRate/Math.sqrt(iteration)
+        val effectiveLearningRate = learningRate / Math.sqrt(iteration)
 
         val newWeights = takeStep(
           weightVector.weights,
@@ -239,6 +263,42 @@ abstract class GradientDescent extends IterativeSolver {
       (left, right) => (left._1 + right._1, left._2 + right._2)
     }.map {
       lossCount => lossCount._1 / lossCount._2
+    }
+  }
+
+  private def getKernelRegularization(weightVectors: DataSet[WeightVector],
+    kernelMatrix: DataSet[Array[Double]]) = {
+    kernelMatrix match {
+      case null => {
+        weightVectors.map(e => (e, DenseVector.init(e.weights.size, 0)))
+      }
+      case matrix => {
+        matrix.crossWithTiny(weightVectors) {
+          (compressedUMatrix, weights) =>
+
+            val weightsWithoutIntercept =
+              weights.weights.toArray.map(e => e._2)
+
+            val size = weightsWithoutIntercept.length
+
+            val expandedUMatrix = new Array[Double](size * size)
+            var k = 0
+            for (i <- 0 until size) {
+              for (j <- 0 to i) {
+                expandedUMatrix(i * size + j) = compressedUMatrix(k)
+                k = k + 1
+              }
+            }
+            val result = new Array[Double](size)
+
+            blas.dsymv("u", size, 1., expandedUMatrix,
+              size, weightsWithoutIntercept, 1, 0., result, 1)
+
+            val regularizationVariable = new DenseVector(result)
+
+            (weights, regularizationVariable)
+        }
+      }
     }
   }
 }

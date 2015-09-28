@@ -34,7 +34,7 @@ class KernelSVMSuite extends FlatSpec with Matchers with FlinkTestBase {
     val env = ExecutionEnvironment.getExecutionEnvironment
 
     val kernelSVM = KernelSVM()
-      .setApproximationRatio(1.0)
+      .setNumberOfBasisPoints(373)
       .setIterations(10)
       .setKernel(new GaussianDistanceMetric(0.2))
       .setLearningRate(0.1)
@@ -54,7 +54,7 @@ class KernelSVMSuite extends FlatSpec with Matchers with FlinkTestBase {
     val env = ExecutionEnvironment.getExecutionEnvironment
 
     val kernelSVM = KernelSVM()
-      .setApproximationRatio(1.0)
+      .setNumberOfBasisPoints(373)
       .setIterations(10)
       .setKernel(new GaussianDistanceMetric(0.2))
       .setLearningRate(0.1)

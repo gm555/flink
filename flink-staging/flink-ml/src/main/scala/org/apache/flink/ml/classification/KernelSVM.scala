@@ -25,6 +25,8 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.flink.ml.math._
 import org.apache.flink.ml.metrics.distances.DistanceMetric
 
+import KernelMachinesSampling.KMeansParallel
+
 /**
  * Implements a non linear kernel SVM using a reformulation of the Nyström approximation by
  * Dhruv Mahajan, S. Sathiya Keerthi and S. Sundararajan ("A Distributed Algorithm
@@ -33,7 +35,10 @@ import org.apache.flink.ml.metrics.distances.DistanceMetric
  * The kernel has to be positive definite.
  *
  * Labels take their values in {-1; 1}.
- * The basis points for the reduced kernel matrix are chosen randomly.
+ *
+ * Basis points are selected using the K-means|| initialization algorithm (B. Bahmani, R. Kumar,
+ * B. Moseley, S. Vassilvitskii and A. Vattani. "Scalable K-Means++", 2012)
+ *
  * The minimization problem is solved by applying batch gradient descent.
  *
  * @example
@@ -52,7 +57,7 @@ import org.apache.flink.ml.metrics.distances.DistanceMetric
  *             val gaussianKernel = new GaussianDistanceMetric(0.2)
  *
  *             val kernelSVM = KernelSVM()
- *               .setApproximationRatio(0.1)
+ *               .setNumberOfBasisPoints(200)
  *               .setIterations(10)
  *               .setKernel(gaussianKernel)
  *               .setLearningRate(0.1)
@@ -105,8 +110,8 @@ class KernelSVM extends Predictor[KernelSVM] {
    * @param approximationRatio
    * @return itself
    */
-  def setApproximationRatio(approximationRatio: Double): KernelSVM = {
-    parameters.add(ApproximationRatio, approximationRatio)
+  def setNumberOfBasisPoints(numberOfBasisPoints: Int): KernelSVM = {
+    parameters.add(NumberOfBasisPoints, numberOfBasisPoints)
     this
   }
 
@@ -160,8 +165,8 @@ object KernelSVM {
 
   // ========================================== Parameters =========================================
 
-  case object ApproximationRatio extends Parameter[Double] {
-    val defaultValue = Some(0.1)
+  case object NumberOfBasisPoints extends Parameter[Int] {
+    val defaultValue = Some(10)
   }
 
   case object RegularizationConstant extends Parameter[Double] {
@@ -200,13 +205,16 @@ object KernelSVM {
         input: DataSet[LabeledVector]): Unit = {
         val p = instance.parameters ++ fitParameters
 
-        val approximationRatio = p(ApproximationRatio)
+        val numberOfBasisPoints = p(NumberOfBasisPoints)
         val iterations = p(Iterations)
         val regularizationConstant = p(RegularizationConstant)
         val learningRate = p(LearningRate)
         val kernel = p(Kernel)
 
-        val markedData = selectBasisPoints(input, approximationRatio)
+        // For the choices  of the settings, see paper
+        val markedData = KMeansParallel(input,
+          numberOfBasisPoints, numberOfBasisPoints, 5)
+
         val basisPointsArray = getBasisPointsArray(markedData)
         val kernelizedData = kernelizeTrainingSet(markedData, basisPointsArray, kernel)
 
@@ -316,11 +324,6 @@ object KernelSVM {
 
   // ========================================== Auxiliary functions ================================
 
-  private def selectBasisPoints(data: DataSet[LabeledVector],
-    approximationRatio: Double): DataSet[(Boolean, LabeledVector)] = {
-    data.map(e => (scala.util.Random.nextDouble < approximationRatio, e))
-  }
-
   private def getBasisPointsArray(
     markedData: DataSet[(Boolean, LabeledVector)]): DataSet[Array[Vector]] = {
     markedData.map(e => (e._1, ArrayBuffer(e._2.vector)))
@@ -368,7 +371,6 @@ object KernelSVM {
     for (i <- 0 until transition.length) {
       transition(i) = kernel.distance(point, basisPointsArray(i))
     }
-
     new DenseVector(transition)
   }
 

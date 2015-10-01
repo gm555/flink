@@ -47,12 +47,6 @@ import KernelMachinesSampling.KMeansParallel
  *             val trainingSet: DataSet[LabeledVector] = ...
  *             val testSet: DataSet[Vector] = ...
  *
- *             // scale features
- *             val scaler = StandardScaler()
- *             scaler.fit(trainingSet)
- *             val scaledTrainingSet = scaler.transform(trainingSet)
- *             val scaledTestSet = scaler.transform(testSet)
- *
  *             // get a positive definite kernel
  *             val gaussianKernel = new GaussianDistanceMetric(0.2)
  *
@@ -63,8 +57,8 @@ import KernelMachinesSampling.KMeansParallel
  *               .setLearningRate(0.1)
  *               .setRegularizationConstant(0.5)
  *
- *             kernelSVM.fit(scaledTrainingSet)
- *             val predictions: DataSet[LabeledVector] = svm.predict(scaledTestSet)
+ *             kernelSVM.fit(trainingSet)
+ *             val predictions: DataSet[LabeledVector] = svm.predict(testSet)
  *          }}}
  *
  * =Parameters=

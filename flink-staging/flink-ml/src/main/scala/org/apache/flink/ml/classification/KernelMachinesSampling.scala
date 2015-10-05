@@ -76,7 +76,8 @@ object KernelMachinesSampling {
     mappedData
   }
 
-  def kMeansPlusPlus(centersToCluster: Array[Vector], numberOfCenters: Int): Array[Vector] = {
+  def kMeansPlusPlus(centersToCluster: Array[Vector], WishedNumberOfCenters: Int): Array[Vector] = {
+    val numberOfCenters = min(WishedNumberOfCenters, centersToCluster.length).toInt
     val centers = new Array[Vector](numberOfCenters)
     val costs = new Array[Double](centersToCluster.length)
 

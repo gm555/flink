@@ -26,7 +26,8 @@ import org.apache.flink.ml.math._
 object KernelMachinesSampling {
 
   def KMeansParallel(data: DataSet[LabeledVector],
-    numberOfCenters: Int, oversamplingFactor: Int, iterations: Int): DataSet[(Boolean, LabeledVector)] = {
+    numberOfCenters: Int, oversamplingFactor: Int, iterations: Int)
+  : (DataSet[(Boolean, LabeledVector)], DataSet[(Array[Vector], Array[Int])]) = {
 
     val initialState = getInitialState(data)
 
@@ -43,46 +44,44 @@ object KernelMachinesSampling {
     }.reduceGroup {
       point =>
         val basisPoints = new ArrayBuffer[Vector]
+        val occurrences = new ArrayBuffer[Int]
         while (point.hasNext) {
-          // we make sure there is no dupplicate among the selection.
-          // If there are, then we delete them ALL.
-          // This way, we can safely map the result of the second clustering
-          // onto the first selection.
+          // we make sure there is no duplicate among the selection.
+          // If there are, we delete the duplicates and keep track
+          // of the number of duplicates.
+          // This way, we can map the result of the second clustering
+          // onto the first selection, telling to each to what extend
+          // it has to have an impact.
           val newPoint = point.next
           val duplicate = basisPoints.indexOf(newPoint)
           if (duplicate == -1) {
             basisPoints += newPoint
+            occurrences += 1
           } else {
-            basisPoints.remove(duplicate)
+            occurrences(duplicate) = occurrences(duplicate) + 1
           }
         }
-        basisPoints.toArray
+        (basisPoints.toArray, occurrences.toArray)
     }
 
     // we cluster the centers on a single machine
     val finalSelection = cleanIntermediateState.map {
       e => kMeansPlusPlus(e, numberOfCenters)
     }
-
-    val mappedData = firstSelection.mapWithBcVariable(finalSelection) {
-      (point, centers) =>
-        if (point._1) {
-          (centers.contains(point._2.vector), point._2)
-        } else {
-          point
-        }
-    }
-
-    mappedData
+    
+    (firstSelection, finalSelection)
   }
 
-  def kMeansPlusPlus(centersToCluster: Array[Vector], WishedNumberOfCenters: Int): Array[Vector] = {
-    val numberOfCenters = min(WishedNumberOfCenters, centersToCluster.length).toInt
+  def kMeansPlusPlus(centersToCluster: (Array[Vector], Array[Int]), WishedNumberOfCenters: Int): (Array[Vector], Array[Int]) = {
+    val numberOfCenters = min(WishedNumberOfCenters, centersToCluster._1.length).toInt
     val centers = new Array[Vector](numberOfCenters)
-    val costs = new Array[Double](centersToCluster.length)
+    val centerCorrespondances = new Array[Int](numberOfCenters)
+    val costs = new Array[Double](centersToCluster._1.length)
 
     // chooses a first center
-    centers(0) = centersToCluster(scala.util.Random.nextInt(centersToCluster.length))
+    val index = scala.util.Random.nextInt(centersToCluster._1.length)
+    centers(0) = centersToCluster._1(index)
+    centerCorrespondances(0) = centersToCluster._2(index)
 
     var totalCost = 0.
     var k = 0
@@ -93,7 +92,7 @@ object KernelMachinesSampling {
       // compute the costs relative to the first center
       totalCost = 0.
       for (j <- 0 until costs.length) {
-        costs(j) = getSquaredDistance(centersToCluster(j), centers(i - 1))
+        costs(j) = getSquaredDistance(centersToCluster._1(j), centers(i - 1))
         totalCost = totalCost + costs(j)
       }
 
@@ -104,8 +103,8 @@ object KernelMachinesSampling {
         k = k + 1
         threshold = threshold - costs(k)
       }
-      centers(i) = centersToCluster(k)
-
+      centers(i) = centersToCluster._1(k)
+      centerCorrespondances(i) = centersToCluster._2(k)
     }
 
     for (i <- 2 until numberOfCenters) {
@@ -113,7 +112,7 @@ object KernelMachinesSampling {
       // compute the costs relative to the last new center
       totalCost = 0.
       for (j <- 0 until costs.length) {
-        costs(j) = min(costs(j), getSquaredDistance(centersToCluster(j), centers(i - 1)))
+        costs(j) = min(costs(j), getSquaredDistance(centersToCluster._1(j), centers(i - 1)))
         totalCost = totalCost + costs(j)
       }
 
@@ -124,10 +123,10 @@ object KernelMachinesSampling {
         k = k + 1
         threshold = threshold - costs(k)
       }
-      centers(i) = centersToCluster(k)
-
+      centers(i) = centersToCluster._1(k)
+      centerCorrespondances(i) = centersToCluster._2(k)
     }
-    centers
+    (centers, centerCorrespondances)
   }
 
   // ========================================== Auxiliary functions ================================

@@ -47,7 +47,14 @@ import KernelMachinesSampling.KMeansParallel
  *             val trainingSet: DataSet[LabeledVector] = ...
  *             val testSet: DataSet[Vector] = ...
  *
- *             // get a positive definite kernel
+ *             // scale features
+ *             val scaler = StandardScaler()
+ *             scaler.fit(trainingSet)
+ *             val scaledTrainingSet = scaler.transform(trainingSet)
+ *             val scaledTestSet = scaler.transform(testSet)
+ *
+ *             // get a positive definite kernel (here, a Gaussian kernel
+ *             // with standard deviation = 0.2)
  *             val gaussianKernel = new GaussianDistanceMetric(0.2)
  *
  *             val kernelSVM = KernelSVM()
@@ -57,8 +64,8 @@ import KernelMachinesSampling.KMeansParallel
  *               .setLearningRate(0.1)
  *               .setRegularizationConstant(0.5)
  *
- *             kernelSVM.fit(trainingSet)
- *             val predictions: DataSet[LabeledVector] = svm.predict(testSet)
+ *             kernelSVM.fit(scaledTrainingSet)
+ *             val predictions: DataSet[LabeledVector] = svm.predict(scaledTestSet)
  *          }}}
  *
  * =Parameters=
@@ -90,9 +97,10 @@ class KernelSVM extends Predictor[KernelSVM] {
 
   /**
    * Information for the predict operation:
-   *  (basis points, learned weight vector)
+   * selected basis points and learned weight vector
    */
-  var learnedInfo: Option[DataSet[(WeightVector, Array[Vector])]] = None
+  var basisPoints: Option[DataSet[Array[Vector]]] = None
+  var weights: Option[DataSet[Vector]] = None
 
   /** Information for monitoring */
   var loss: DataSet[Double] = null
@@ -187,6 +195,16 @@ object KernelSVM {
 
   // ========================================== Operations =========================================
 
+  def KernalizationOperation(data: DataSet[LabeledVector], numberOfBasisPoints: Int, kernel: DistanceMetric) = {
+
+    val (firstSelection, finalSelection) = KMeansParallel(data,
+      numberOfBasisPoints, numberOfBasisPoints, 5)
+
+    val kernelizedData = kernelizeData(firstSelection, finalSelection, kernel)
+
+    kernelizedData
+  }
+
   /**
    * [[FitOperation]] which trains a kernel SVM based on a given training data set.
    *
@@ -196,24 +214,26 @@ object KernelSVM {
       override def fit(
         instance: KernelSVM,
         fitParameters: ParameterMap,
-        input: DataSet[LabeledVector]): Unit = {
+        data: DataSet[LabeledVector]): Unit = {
         val p = instance.parameters ++ fitParameters
 
-        val numberOfBasisPoints = p(NumberOfBasisPoints)
         val iterations = p(Iterations)
         val regularizationConstant = p(RegularizationConstant)
         val learningRate = p(LearningRate)
-        val kernel = p(Kernel)
 
-        // For the choices  of the settings, see paper
-        val markedData = KMeansParallel(input,
+        val kernel = p(Kernel)
+        val numberOfBasisPoints = p(NumberOfBasisPoints)
+
+        //////////////////////////////////////////////////////////////
+        val (firstSelection, finalSelection) = KMeansParallel(data,
           numberOfBasisPoints, numberOfBasisPoints, 5)
 
-        val basisPointsArray = getBasisPointsArray(markedData)
-        val kernelizedData = kernelizeTrainingSet(markedData, basisPointsArray, kernel)
+        val kernelizedData = kernelizeData(firstSelection, finalSelection, kernel)
+
+        //////////////////////////////////////////////////////////////
 
         val weights = kernelizedData.first(1).map(e =>
-          WeightVector(DenseVector.init(e._2.vector.size, 0), 0))
+          WeightVector(DenseVector.init(e._3.vector.size, 0), 0))
 
         val newWeights = weights.iterate(iterations) {
           weightVectorDS =>
@@ -221,17 +241,16 @@ object KernelSVM {
               regularizationConstant, learningRate)
         }
 
-        // Stores the learned information in the given instance
-        val info = newWeights.cross(basisPointsArray) {
-          (l, r) => (l, r)
-        }
-        instance.learnedInfo = Some(info)
+        // Stores the basis points
+        instance.basisPoints = Some(finalSelection.map(e => e._1))
+        // Stores the weights
+        instance.weights = Some(newWeights.map(e => e.weights))
 
         // sets the loss for this model in case we want to
         // try out different settings
         instance.loss = kernelizedData.mapWithBcVariable(newWeights) {
           (point, weights) =>
-            (getUnregularizedLoss(point._2, weights), 1)
+            (getUnregularizedLoss(point._3, weights), 1)
         }.reduce {
           (e1, e2) => ((e1._1 + e2._1), (e1._2 + e2._2))
         }.map(e => e._1 / e._2)
@@ -246,32 +265,44 @@ object KernelSVM {
    *
    * @return A DataSet[LabeledVector].
    */
-  implicit def predictLabels = {
-    new PredictDataSetOperation[KernelSVM, DenseVector, LabeledVector] {
+  implicit def predictOnVector = {
+    new PredictDataSetOperation[KernelSVM, Vector, (Double, Vector)] {
       override def predictDataSet(
         instance: KernelSVM,
         predictParameters: ParameterMap,
-        input: DataSet[DenseVector]): DataSet[LabeledVector] = {
+        data: DataSet[Vector]): DataSet[(Double, Vector)] = {
+
         val p = instance.parameters ++ predictParameters
 
         val kernel = p(Kernel)
 
-        instance.learnedInfo match {
-          case Some(info) => {
-            input.mapWithBcVariable(info) {
-              (point, info) =>
-                val (weights, basisPoints) = info
-                val kernelizedPoint = kernelizePoint(point,
-                  basisPoints, kernel)
-                val dot = BLAS.dot(kernelizedPoint, weights.weights)
-                val label = if (dot > 0) 1 else -1
-                LabeledVector(label, point)
+        instance.basisPoints match {
+
+          case Some(bps) => {
+
+            val kernelizedData = data.mapWithBcVariable(bps) {
+              (point, bp) => kernelizePoint(point, bp, kernel)
+            }
+
+            instance.weights match {
+
+              case Some(information) => {
+                kernelizedData.mapWithBcVariable(information) {
+                  (kernelizedPoint, info) =>
+
+                    val dot = BLAS.dot(kernelizedPoint, info)
+                    val prediction = if (dot > 0) 1 else -1
+                    (prediction, kernelizedPoint)
+                }
+              }
             }
           }
+
           case None => {
             throw new RuntimeException("The KernelSVM model has not been trained. Call first fit" +
               "before calling the predict operation.")
           }
+
         }
       }
     }
@@ -285,32 +316,44 @@ object KernelSVM {
    *
    * @return A DataSet[LabeledVector].
    */
-  implicit def predictLabelsForComparison = {
+  implicit def predictOnLabeledVector = {
     new PredictDataSetOperation[KernelSVM, LabeledVector, (Double, LabeledVector)] {
       override def predictDataSet(
         instance: KernelSVM,
         predictParameters: ParameterMap,
-        input: DataSet[LabeledVector]): DataSet[(Double, LabeledVector)] = {
+        data: DataSet[LabeledVector]): DataSet[(Double, LabeledVector)] = {
+
         val p = instance.parameters ++ predictParameters
 
         val kernel = p(Kernel)
 
-        instance.learnedInfo match {
-          case Some(info) => {
-            input.mapWithBcVariable(info) {
-              (point, info) =>
-                val (weights, basisPoints) = info
-                val kernelizedPoint = kernelizePoint(point.vector,
-                  basisPoints, kernel)
-                val dot = BLAS.dot(kernelizedPoint, weights.weights)
-                val label = if (dot > 0) 1 else -1
-                (label, point)
+        instance.basisPoints match {
+
+          case Some(bps) => {
+
+            val kernelizedData = data.mapWithBcVariable(bps) {
+              (point, bp) => LabeledVector(point.label, kernelizePoint(point.vector, bp, kernel))
+            }
+
+            instance.weights match {
+
+              case Some(information) => {
+                kernelizedData.mapWithBcVariable(information) {
+                  (kernelizedPoint, info) =>
+
+                    val dot = BLAS.dot(kernelizedPoint.vector, info)
+                    val prediction = if (dot > 0) 1 else -1
+                    (prediction, kernelizedPoint)
+                }
+              }
             }
           }
+
           case None => {
             throw new RuntimeException("The KernelSVM model has not been trained. Call first fit" +
               "before calling the predict operation.")
           }
+
         }
       }
     }
@@ -357,6 +400,32 @@ object KernelSVM {
     }
   }
 
+  /*
+   * Each training example is transposed into the feature space.
+   * The first Int is the number of points like self (self included)
+   * that correspond to a basis point
+   * The second Int is the index where a point has an impact on
+   * the regularization
+   */
+  private def kernelizeData(firstSelection: DataSet[(Boolean, LabeledVector)],
+    finalSelection: DataSet[(Array[Vector], Array[Int])],
+    kernel: DistanceMetric): DataSet[(Int, Int, LabeledVector)] = {
+    firstSelection.mapWithBcVariable(finalSelection) {
+      (point, centers) =>
+        if (point._1) {
+          val index = centers._1.indexOf(point._2.vector)
+          if (index == -1) {
+            (0, 0, LabeledVector(point._2.label, kernelizePoint(point._2.vector, centers._1, kernel)))
+          } else {
+            (centers._2(index), point._2)
+            (centers._2(index), index, LabeledVector(point._2.label, kernelizePoint(point._2.vector, centers._1, kernel)))
+          }
+        } else {
+          (0, 0, LabeledVector(point._2.label, kernelizePoint(point._2.vector, centers._1, kernel)))
+        }
+    }
+  }
+
   private def kernelizePoint(point: Vector,
     basisPointsArray: Array[Vector],
     kernel: DistanceMetric): Vector = {
@@ -369,7 +438,7 @@ object KernelSVM {
   }
 
   private def batchGradientDescentStep(
-    indexedData: DataSet[(Array[Int], LabeledVector)],
+    indexedData: DataSet[(Int, Int, LabeledVector)],
     currentWeights: DataSet[WeightVector],
     regularizationConstant: Double,
     learningRate: Double): DataSet[WeightVector] = {
@@ -405,28 +474,30 @@ object KernelSVM {
     }
   }
 
-  private def getRegularizedGradient(indexedDataPoint: (Array[Int], LabeledVector),
+  private def getRegularizedGradient(indexedDataPoint: (Int, Int, LabeledVector),
     weightVector: WeightVector,
     regularizationConstant: Double): WeightVector = {
 
-    val dotRegularization = BLAS.dot(indexedDataPoint._2.vector, weightVector.weights)
+    val dotRegularization = BLAS.dot(indexedDataPoint._3.vector, weightVector.weights)
     val dot = dotRegularization + weightVector.intercept
 
-    val marginEncroachmentCosts = 1 - dot * indexedDataPoint._2.label
+    val marginEncroachmentCosts = 1 - dot * indexedDataPoint._3.label
     val marginEncroachments = if (marginEncroachmentCosts > 0) 1 else 0
 
-    val scaler = marginEncroachments * (dot - indexedDataPoint._2.label)
-    BLAS.scal(scaler, indexedDataPoint._2.vector)
+    val scaler = marginEncroachments * (dot - indexedDataPoint._3.label)
+    BLAS.scal(scaler, indexedDataPoint._3.vector)
 
-    for (i <- 0 until indexedDataPoint._1.length) {
+    // for (i <- 0 until indexedDataPoint._1.length) 
+
+    if (indexedDataPoint._1 > 0) {
       val partialGradientRegularization =
         regularizationConstant * dotRegularization /
-          indexedDataPoint._1.length
+          indexedDataPoint._1
 
-      indexedDataPoint._2.vector(indexedDataPoint._1(i)) =
-        indexedDataPoint._2.vector(indexedDataPoint._1(i)) + partialGradientRegularization
+      indexedDataPoint._3.vector(indexedDataPoint._2) =
+        indexedDataPoint._3.vector(indexedDataPoint._2) + partialGradientRegularization
     }
-    WeightVector(indexedDataPoint._2.vector, scaler)
+    WeightVector(indexedDataPoint._3.vector, scaler)
   }
 
   private def getUnregularizedLoss(dataPoint: LabeledVector,

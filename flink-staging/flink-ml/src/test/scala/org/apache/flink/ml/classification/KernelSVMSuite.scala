@@ -39,6 +39,8 @@ class KernelSVMSuite extends FlatSpec with Matchers with FlinkTestBase {
       .setKernel(new GaussianDistanceMetric(0.2))
       .setLearningRate(0.1)
       .setRegularizationConstant(0.1)
+      .setOversamplingFactor(100) // => just to ensure the probability
+      .setSelectionRounds(10)     //    to have 373 basis points
 
     val trainingDS = env.fromCollection(NonLinearClassification.trainingData)
 

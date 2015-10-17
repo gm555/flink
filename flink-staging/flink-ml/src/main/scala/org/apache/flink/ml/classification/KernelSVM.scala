@@ -63,6 +63,8 @@ import KernelMachinesSampling.KMeansParallel
  *               .setKernel(gaussianKernel)
  *               .setLearningRate(0.1)
  *               .setRegularizationConstant(0.5)
+ *               .setOversamplingFactor(50)
+ *               .setSelectionRounds(5)
  *
  *             kernelSVM.fit(scaledTrainingSet)
  *             val predictions: DataSet[LabeledVector] = svm.predict(scaledTestSet)
@@ -70,26 +72,37 @@ import KernelMachinesSampling.KMeansParallel
  *
  * =Parameters=
  *
- *  - [[org.apache.flink.ml.classification.KernelSVM.approximationRatio]]:
- *  Sets the ratio to which the kernel matrix will be approximated. This
- *  number should be at most 1.0 (i.e. no approximation).
- *  (Default Value: '''0.1''')
+ *  - [[org.apache.flink.ml.classification.KernelSVM.NumberOfBasisPoints]]:
+ *  Sets the number of basis points with which the kernel matrix will be
+ *  approximated.
+ *  (Default Value: '''100''')
  *
  *  - [[org.apache.flink.ml.classification.KernelSVM.RegularizationConstant]]:
  *  Defines the regularization constant of the kernel SVM algorithm.
- *  (Default value: '''1.0''')
+ *  (Default value: '''0.1''')
  *
  *  - [[org.apache.flink.ml.classification.KernelSVM.Iterations]]:
  *  Defines the number of iterations of the outer loop method.
  *  (Default value: '''10''')
  *
  *  - [[org.apache.flink.ml.classification.KernelSVM.LearningRate]]:
- *  Defines the initial step size for the updates of the weight vector. This value has to be tuned
- *  in case that the algorithm becomes instable. (Default value: '''0.1''')
+ *  Defines the initial step size for the updates of the weight vector.
+ *  This value has to be tuned in case that the algorithm becomes unstable.
+ *  (Default value: '''0.1''')
  *
  *  - [[org.apache.flink.ml.classification.KernelSVM.Kernel]]:
  *  Defines the kernel to use. This kernel has to be positive definite.
  *  (Default value: '''None''')
+ *  
+ *  - [[org.apache.flink.ml.classification.KernelSVM.OversamplingFactor]]:
+ *  Defines the number of points to select at each round of the K-Means-parallel.
+ *  Preference: oversamplingFactor * selectionRound > numberOfBasisPoints
+ *  (Default value: '''30''')
+ *  
+ *  - [[org.apache.flink.ml.classification.KernelSVM.SelectionRound]]:
+ *  Defines number of selection rounds in the K-means-parallel initialization.
+ *  Preference: oversamplingFactor * selectionRound > numberOfBasisPoints
+ *  (Default value: '''5''')
  */
 class KernelSVM extends Predictor[KernelSVM] {
 
@@ -160,6 +173,28 @@ class KernelSVM extends Predictor[KernelSVM] {
     parameters.add(Kernel, kernel)
     this
   }
+  
+    /**
+   * Sets the learning rate
+   *
+   * @param learningRate
+   * @return itself
+   */
+  def setOversamplingFactor(oversamplingFactor: Int): KernelSVM = {
+    parameters.add(OversamplingFactor, oversamplingFactor)
+    this
+  }
+
+  /**
+   * Sets the kernel
+   *
+   * @param kernel
+   * @return itself
+   */
+  def setSelectionRounds(selectionRounds: Int): KernelSVM = {
+    parameters.add(SelectionRounds, selectionRounds)
+    this
+  }
 
 }
 
@@ -168,11 +203,11 @@ object KernelSVM {
   // ========================================== Parameters =========================================
 
   case object NumberOfBasisPoints extends Parameter[Int] {
-    val defaultValue = Some(10)
+    val defaultValue = Some(100)
   }
 
   case object RegularizationConstant extends Parameter[Double] {
-    val defaultValue = Some(1.0)
+    val defaultValue = Some(0.1)
   }
 
   case object Iterations extends Parameter[Int] {
@@ -186,6 +221,14 @@ object KernelSVM {
   case object Kernel extends Parameter[DistanceMetric] {
     val defaultValue = None
   }
+  
+    case object OversamplingFactor extends Parameter[Int] {
+    val defaultValue = Some(30)
+  }
+
+  case object SelectionRounds extends Parameter[Int] {
+    val defaultValue = Some(5)
+  }
 
   // ========================================== Factory methods ====================================
 
@@ -194,16 +237,6 @@ object KernelSVM {
   }
 
   // ========================================== Operations =========================================
-
-  def KernalizationOperation(data: DataSet[LabeledVector], numberOfBasisPoints: Int, kernel: DistanceMetric) = {
-
-    val (firstSelection, finalSelection) = KMeansParallel(data,
-      numberOfBasisPoints, numberOfBasisPoints, 5)
-
-    val kernelizedData = kernelizeData(firstSelection, finalSelection, kernel)
-
-    kernelizedData
-  }
 
   /**
    * [[FitOperation]] which trains a kernel SVM based on a given training data set.
@@ -223,14 +256,14 @@ object KernelSVM {
 
         val kernel = p(Kernel)
         val numberOfBasisPoints = p(NumberOfBasisPoints)
+        
+        val oversamplingFactor = p(OversamplingFactor)
+        val selectionRounds = p(SelectionRounds)
 
-        //////////////////////////////////////////////////////////////
         val (firstSelection, finalSelection) = KMeansParallel(data,
-          numberOfBasisPoints, numberOfBasisPoints, 5)
+          numberOfBasisPoints, oversamplingFactor, selectionRounds)
 
         val kernelizedData = kernelizeData(firstSelection, finalSelection, kernel)
-
-        //////////////////////////////////////////////////////////////
 
         val weights = kernelizedData.first(1).map(e =>
           WeightVector(DenseVector.init(e._3.vector.size, 0), 0))
@@ -486,8 +519,6 @@ object KernelSVM {
 
     val scaler = marginEncroachments * (dot - indexedDataPoint._3.label)
     BLAS.scal(scaler, indexedDataPoint._3.vector)
-
-    // for (i <- 0 until indexedDataPoint._1.length) 
 
     if (indexedDataPoint._1 > 0) {
       val partialGradientRegularization =
